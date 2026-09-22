@@ -1,0 +1,42 @@
+name: zheshe-daily-digest
+
+on:
+  schedule:
+    # 北京时间每天 06:20（UTC 22:20）
+    - cron: '20 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run digest
+        env:
+          SENDER: ${{ secrets.SENDER }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECEIVER: ${{ secrets.RECEIVER }}
+        run: python src/digest.py
+
+      - name: Commit dedup state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/sent_ids.json
+          git diff --cached --quiet || git commit -m "chore: update sent_ids state [skip ci]"
+          git push
