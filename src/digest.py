@@ -49,7 +49,7 @@ TOP_N = int(os.environ.get("TOP_N", "10"))          # 推荐篇数
 LIST_MAX = int(os.environ.get("LIST_MAX", "100"))   # 清单上限
 FETCH_PAGES = int(os.environ.get("FETCH_PAGES", "8"))  # 抓取页数（每页 20 篇）
 
-FOCUS = "工商管理类 · 企业创新 / 数字化转型 / 人工智能应用 / 贝叶斯与机器学习"
+FOCUS = "应用经济学 / 工商管理学 / 管理科学与工程 · 企业创新 / 数字化转型 / 人工智能应用 / 贝叶斯与机器学习"
 
 
 def cn_today():
@@ -199,6 +199,17 @@ def score_paper(p, keywords, focus_subjects):
     title = p["title"]
     abstract = p["abstract"]
     hits, matched = 0, []
+    exclude = keywords.get("exclude", [])
+
+    # 排除词：命中标题或分类 → 直接淘汰（图情档/旅游/物流等无关领域）
+    for ex in exclude:
+        if ex in title or any(ex in c for c in p["category"]):
+            return -1000, [f"排除:{ex}"]
+    # 摘要命中 → 重罚（留极少高度相关论文一线机会）
+    for ex in exclude:
+        if ex in abstract:
+            hits -= 15
+            matched.append(f"排除:{ex}")
 
     def hit(k):
         nonlocal hits
@@ -379,10 +390,13 @@ def main():
     scored.sort(key=lambda p: p["hits"], reverse=True)
     recommended = scored[:TOP_N]
 
-    # 清单：最近两天的论文，按日期倒序（列表页本身已倒序）
+    # 清单：最近两天的论文，按日期倒序（列表页本身已倒序），并剔除明显无关领域
+    exclude = keywords.get("exclude", [])
     cutoff = cn_today() - dt.timedelta(days=1)
     checklist = []
     for p in fresh:
+        if any(ex in p["title"] or any(ex in c for c in p["category"]) for ex in exclude):
+            continue
         try:
             d = dt.date.fromisoformat(p["date"])
         except Exception:
