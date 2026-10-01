@@ -195,13 +195,13 @@ def fetch_papers(session, pages):
 
 
 # ---------------------------------------------------------------------------
-def score_paper(p, keywords, focus_subjects):
+def score_paper(p, keywords):
     title = p["title"]
     abstract = p["abstract"]
     hits, matched = 0, []
     exclude = keywords.get("exclude", [])
 
-    # 排除词：命中标题或分类 → 直接淘汰（图情档/旅游/物流等无关领域）
+    # 排除词：命中标题或分类 → 直接淘汰（旅游/物流等；图情档已由学科白名单拦截）
     for ex in exclude:
         if ex in title or any(ex in c for c in p["category"]):
             return -1000, [f"排除:{ex}"]
@@ -237,12 +237,6 @@ def score_paper(p, keywords, focus_subjects):
         elif kl in abstract.lower():
             hits += 2
             matched.append(k)
-
-    # 学科加权
-    for c in p["category"]:
-        if c in focus_subjects:
-            hits += 2
-            matched.append(f"[{c}]")
 
     return hits, matched
 
@@ -366,7 +360,7 @@ def send_email(html_body, subject):
 def main():
     keywords = load_json(KEYWORDS_FILE)
     subjects = load_json(SUBJECTS_FILE)
-    focus = subjects.get("focus", [])
+    allow = subjects.get("allow", [])
     state = load_state()
     sent = set(state.get("sent_ids", []))
 
@@ -380,21 +374,30 @@ def main():
         send_email("<p>今日暂无新论文发布。</p>", subject)
         return
 
-    # 推荐：按关键词 + 学科打分
+    # 硬门槛：只保留 工商管理 / 管理科学与工程 / 应用经济学 学科
+    eligible = [p for p in fresh if any(c in allow for c in p["category"])]
+    print(f"[info] 学科过滤后 {len(eligible)} 篇（仅限工商管理/管科/应用经济学）", file=sys.stderr)
+
+    if not eligible:
+        subject = f"哲社预印本日报 · {cn_today()} · 今日暂无相关学科论文"
+        send_email("<p>今日暂无 工商管理 / 管理科学与工程 / 应用经济学 学科的新论文。</p>", subject)
+        return
+
+    # 推荐：在学科白名单内按关键词打分
     scored = []
-    for p in fresh:
-        hits, matched = score_paper(p, keywords, focus)
+    for p in eligible:
+        hits, matched = score_paper(p, keywords)
         p["hits"], p["matched"] = hits, matched
         if hits > 0:
             scored.append(p)
     scored.sort(key=lambda p: p["hits"], reverse=True)
     recommended = scored[:TOP_N]
 
-    # 清单：最近两天的论文，按日期倒序（列表页本身已倒序），并剔除明显无关领域
+    # 清单：学科白名单内最近两天，并剔除旅游/物流等排除词
     exclude = keywords.get("exclude", [])
     cutoff = cn_today() - dt.timedelta(days=1)
     checklist = []
-    for p in fresh:
+    for p in eligible:
         if any(ex in p["title"] or any(ex in c for c in p["category"]) for ex in exclude):
             continue
         try:
