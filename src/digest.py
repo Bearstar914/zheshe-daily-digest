@@ -10,6 +10,7 @@ zheshe-daily-digest
 - 每天北京时间 06:20 推送（GitHub Actions cron `20 22 * * *`，UTC）
 """
 import datetime as dt
+import hashlib
 import html
 import json
 import os
@@ -47,7 +48,6 @@ RECEIVER = os.environ.get("RECEIVER", "")
 
 TOP_N = int(os.environ.get("TOP_N", "10"))          # 推荐篇数
 LIST_MAX = int(os.environ.get("LIST_MAX", "100"))   # 清单上限
-FETCH_PAGES = int(os.environ.get("FETCH_PAGES", "8"))  # 抓取页数（每页 20 篇）
 
 FOCUS = "应用经济学 / 工商管理学 / 管理科学与工程 · 企业创新 / 数字化转型 / 人工智能应用 / 贝叶斯与机器学习"
 
@@ -74,12 +74,38 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def _solve_challenge(session, url, resp_text):
+    """应对平台 WAF 的 md5(IP) JS 挑战：解出 token 并重定向放行。
+
+    高频请求会被平台要求 JS 验证，挑战页形如
+    `window.location.href="?xxx="+md5("<客户端IP>")`，IP 明文写在响应里。
+    算出 md5(IP) 作为 token 带上重定向即可通过。返回放行后的页面文本；
+    若非挑战页返回 None。
+    """
+    m_ip = re.search(r'md5\("([\d.]+)"\)', resp_text)
+    m_key = re.search(r'[\?&]([a-zA-Z0-9]+)="\+md5', resp_text)
+    if not m_ip or not m_key:
+        return None
+    token = hashlib.md5(m_ip.group(1).encode("utf-8")).hexdigest()
+    sep = "&" if "?" in url else "?"
+    r = session.get(f"{url}{sep}{m_key.group(1)}={token}", timeout=40)
+    if r.status_code == 200 and r.text:
+        r.encoding = "utf-8"
+        return r.text
+    return None
+
+
 def _get(session, url, **kwargs):
     for attempt in range(3):
         try:
             r = session.get(url, timeout=40, **kwargs)
             if r.status_code == 200 and r.text:
                 r.encoding = "utf-8"
+                # WAF md5(IP) 挑战：响应含 md5 挑战脚本 → 解挑战放行
+                if 'md5("' in r.text and "window.location.href" in r.text:
+                    solved = _solve_challenge(session, url, r.text)
+                    if solved and 'md5("' not in solved:
+                        return solved
                 return r.text
             print(f"[warn] HTTP {r.status_code} len={len(r.text)} (第{attempt + 1}次) {url}",
                   file=sys.stderr)
@@ -167,30 +193,34 @@ def parse_list(html_text):
     return papers
 
 
-def fetch_papers(session, pages):
-    """抓取最新 pages 页论文，返回去重后的论文列表（时间倒序）。"""
-    page1 = _get(session, SEARCH_URL)
-    if not page1:
-        return []
-    m = re.search(r"pageId=(\d+)", page1)
-    if not m:
-        print("[error] 未获取到 pageId", file=sys.stderr)
-        return []
-    page_id = m.group(1)
+def fetch_papers(subject_ids):
+    """按学科 ID 抓取各学科最新论文，合并去重。
 
+    平台把论文按学科归档（filterField=subjects），直接按学科 ID 抓能精确
+    锁定 工商管理 / 管理科学与工程 / 应用经济学，避免「最新列表」被一天几十篇
+    图情档论文淹没、导致目标学科论文排不进前几页的问题。
+
+    每个学科用独立 session 抓第 1 页（20 篇，时间倒序）。平台对高频请求
+    会随机限流（连续抓后半段学科容易返回空），故学科间 sleep、单学科失败后
+    重建 session 重试一次，尽量保证每个学科都能抓到。
+    """
     all_papers, seen = [], set()
-    for html_text, page_no in [(page1, 1)] + [
-        (_get(session, f"{SEARCH_URL}?pageId={page_id}&setId=recordList&currentPage={n}"), n + 1)
-        for n in range(1, pages)
-    ]:
-        if not html_text:
-            continue
-        for p in parse_list(html_text):
-            if p["id"] and p["id"] not in seen:
-                seen.add(p["id"])
-                all_papers.append(p)
-        print(f"[info] 第 {page_no} 页抓完，累计 {len(all_papers)} 篇", file=sys.stderr)
-        time.sleep(1.2)
+    for sid in subject_ids:
+        html1 = None
+        for attempt in range(2):
+            sess = build_session()
+            html1 = _get(sess, f"{SEARCH_URL}?type=filter&filterField=subjects&value={sid}")
+            if html1:
+                break
+            print(f"[warn] 学科 {sid} 第 {attempt + 1} 次抓取失败，稍后重试", file=sys.stderr)
+            time.sleep(3)
+        if html1:
+            for p in parse_list(html1):
+                if p["id"] and p["id"] not in seen:
+                    seen.add(p["id"])
+                    all_papers.append(p)
+        print(f"[info] 学科 {sid} 抓完，累计 {len(all_papers)} 篇", file=sys.stderr)
+        time.sleep(3)
     return all_papers
 
 
@@ -360,12 +390,13 @@ def send_email(html_body, subject):
 def main():
     keywords = load_json(KEYWORDS_FILE)
     subjects = load_json(SUBJECTS_FILE)
+    subject_ids = list(subjects.get("subject_ids", {}).keys())
     allow = subjects.get("allow", [])
+    exclude_subjects = subjects.get("exclude_subjects", [])
     state = load_state()
     sent = set(state.get("sent_ids", []))
 
-    session = build_session()
-    papers = fetch_papers(session, FETCH_PAGES)
+    papers = fetch_papers(subject_ids)
     fresh = [p for p in papers if p["id"] not in sent]
     print(f"[info] 抓取 {len(papers)} 篇，去重后新论文 {len(fresh)} 篇", file=sys.stderr)
 
@@ -374,26 +405,18 @@ def main():
         send_email("<p>今日暂无新论文发布。</p>", subject)
         return
 
-    # 硬门槛：只保留 工商管理 / 管理科学与工程 / 应用经济学 学科
-    eligible = [p for p in fresh if any(c in allow for c in p["category"])]
-    print(f"[info] 学科过滤后 {len(eligible)} 篇（仅限工商管理/管科/应用经济学）", file=sys.stderr)
+    # 二次过滤：学科 ID 抓取后，再按 category 标签剔除混入的其它学科论文。
+    # 论文常同时标多个学科，若命中目标学科(allow)但同时也命中非目标学科(exclude_subjects)，则剔除。
+    eligible = [p for p in fresh if any(c in allow for c in p["category"])
+                and not any(any(es in c for c in p["category"]) for es in exclude_subjects)]
+    print(f"[info] 学科二次过滤后 {len(eligible)} 篇（仅限工商管理/管科/应用经济学）", file=sys.stderr)
 
     if not eligible:
         subject = f"哲社预印本日报 · {cn_today()} · 今日暂无相关学科论文"
         send_email("<p>今日暂无 工商管理 / 管理科学与工程 / 应用经济学 学科的新论文。</p>", subject)
         return
 
-    # 推荐：在学科白名单内按关键词打分
-    scored = []
-    for p in eligible:
-        hits, matched = score_paper(p, keywords)
-        p["hits"], p["matched"] = hits, matched
-        if hits > 0:
-            scored.append(p)
-    scored.sort(key=lambda p: p["hits"], reverse=True)
-    recommended = scored[:TOP_N]
-
-    # 清单：学科白名单内最近两天，并剔除旅游/物流等排除词
+    # 清单：学科白名单内、最近两天、并剔除旅游/物流等排除词
     exclude = keywords.get("exclude", [])
     cutoff = cn_today() - dt.timedelta(days=1)
     checklist = []
@@ -407,6 +430,21 @@ def main():
         if d is None or d >= cutoff:
             checklist.append(p)
     checklist = checklist[:LIST_MAX]
+
+    if not checklist:
+        subject = f"哲社预印本日报 · {cn_today()} · 今日暂无新论文"
+        send_email("<p>今日暂无 工商管理 / 管理科学与工程 / 应用经济学 学科的新论文。</p>", subject)
+        return
+
+    # 推荐：在清单（当天/昨天新论文）里按关键词打分
+    scored = []
+    for p in checklist:
+        hits, matched = score_paper(p, keywords)
+        p["hits"], p["matched"] = hits, matched
+        if hits > 0:
+            scored.append(p)
+    scored.sort(key=lambda p: p["hits"], reverse=True)
+    recommended = scored[:TOP_N]
 
     print(f"[info] 推荐 {len(recommended)} 篇，清单 {len(checklist)} 篇", file=sys.stderr)
 
